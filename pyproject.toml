@@ -1,0 +1,19 @@
+[project]
+name = "rekordbox-cli"
+version = "0.1.0"
+description = "CLI tool for managing and enriching your rekordbox library"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "pyrekordbox>=0.4",
+    "sqlcipher3-wheels>=0.5",
+    "click>=8.0",
+]
+
+[project.scripts]
+rb = "rekordbox_cli.main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
