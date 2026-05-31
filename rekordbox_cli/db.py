@@ -4,7 +4,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from pyrekordbox import Rekordbox6Database, get_config
+from pyrekordbox import Rekordbox6Database
 
 
 def get_database() -> Rekordbox6Database:
@@ -14,8 +14,17 @@ def get_database() -> Rekordbox6Database:
 
 def get_db_path() -> Path:
     """Find the master.db path from pyrekordbox config."""
-    config = get_config()
-    return Path(config["db_path"])
+    from pyrekordbox import get_config
+    # Try rekordbox7 first, then rekordbox6
+    for section in ("rekordbox7", "rekordbox6"):
+        try:
+            db_path = get_config(section, "db_path")
+            if db_path:
+                return Path(db_path)
+        except (KeyError, TypeError):
+            continue
+    # Fallback to known default
+    return Path.home() / "Library/Pioneer/rekordbox/master.db"
 
 
 def create_backup(label: str) -> Path:

@@ -57,16 +57,21 @@ def get_or_create_genre(db, name: str, genre_cache: dict) -> DjmdGenre:
     return genre
 
 
-def set_genres(db, dry_run: bool = False, force: bool = False) -> dict:
+def set_genres(db, dry_run: bool = False, force: bool = False, lastfm_client=None, spotify_client=None, verbose: bool = False) -> dict:
     """Classify and tag genres on tracks.
+
+    Priority: Spotify API → Last.fm API → local rules.
 
     Args:
         db: Rekordbox6Database instance.
         dry_run: If True, don't write changes.
         force: If True, re-tag all tracks (not just untagged).
+        lastfm_client: Optional LastFmClient for API-based lookups.
+        spotify_client: Optional SpotifyClient for API-based lookups.
+        verbose: If True, print per-track classification details.
 
     Returns:
-        dict with keys: total, assigned, unclassified, genre_counts
+        dict with keys: total, assigned, unclassified, genre_counts, api_hits, local_hits
     """
     # Build playlist → track mapping
     playlist_songs = db.get_playlist_songs().all()
@@ -88,11 +93,37 @@ def set_genres(db, dry_run: bool = False, force: bool = False) -> dict:
         target = [t for t in tracks if not t.Genre]
 
     assigned = 0
+    api_hits = 0
+    local_hits = 0
     genre_counts = defaultdict(int)
 
-    for t in target:
-        pls = track_playlists.get(t.ID, [])
-        genre_name = classify_track(t, pls)
+    for i, t in enumerate(target):
+        genre_name = None
+        source = None
+        artist = t.Artist.Name if t.Artist else ""
+        title = t.Title or ""
+
+        # 1. Primary: Spotify API lookup
+        if spotify_client and (artist or title):
+            genre_name = spotify_client.get_genre(artist, title)
+            if genre_name:
+                api_hits += 1
+                source = "spotify"
+
+        # 2. Secondary: Last.fm API lookup
+        if not genre_name and lastfm_client and (artist or title):
+            genre_name = lastfm_client.get_genre(artist, title)
+            if genre_name:
+                api_hits += 1
+                source = "lastfm"
+
+        # 3. Fallback: local playlist/artist/keyword rules
+        if not genre_name:
+            pls = track_playlists.get(t.ID, [])
+            genre_name = classify_track(t, pls)
+            if genre_name:
+                local_hits += 1
+                source = "local"
 
         if genre_name:
             genre_counts[genre_name] += 1
@@ -101,11 +132,20 @@ def set_genres(db, dry_run: bool = False, force: bool = False) -> dict:
                 t.GenreID = genre_obj.ID
             assigned += 1
 
+        if verbose:
+            display = f"{artist} - {title}" if (artist or title) else "(no metadata)"
+            if genre_name:
+                click.echo(click.style(f"  ✓ [{source}] {display} → {genre_name}", fg="green"))
+            else:
+                click.echo(click.style(f"  ✗ {display}", fg="red"))
+
     return {
         "total": len(target),
         "assigned": assigned,
         "unclassified": len(target) - assigned,
         "genre_counts": dict(genre_counts),
+        "api_hits": api_hits,
+        "local_hits": local_hits,
     }
 
 
@@ -116,6 +156,10 @@ def print_summary(result: dict, dry_run: bool = False):
     click.echo(f"\n{prefix}Genre tagging results:")
     click.echo(f"  Tracks processed: {result['total']}")
     click.echo(click.style(f"  ✓ Assigned: {result['assigned']}", fg="green"))
+    if result.get("api_hits"):
+        click.echo(f"    ↳ via Last.fm: {result['api_hits']}")
+    if result.get("local_hits"):
+        click.echo(f"    ↳ via local rules: {result['local_hits']}")
     click.echo(click.style(f"  ✗ Unclassified: {result['unclassified']}", fg="yellow"))
     click.echo()
     click.echo("  Genre breakdown:")
