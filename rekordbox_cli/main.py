@@ -1,6 +1,8 @@
 """rekordbox-cli: CLI entry point."""
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import click
@@ -29,6 +31,31 @@ def cli():
     pass
 
 
+def _copy_to_clipboard(text: str) -> str:
+    """Copy text to OS clipboard and return the command used."""
+    commands = [
+        ("pbcopy", ["pbcopy"]),
+        ("wl-copy", ["wl-copy"]),
+        ("xclip", ["xclip", "-selection", "clipboard"]),
+        ("xsel", ["xsel", "--clipboard", "--input"]),
+        ("clip", ["clip"]),
+    ]
+    errors = []
+
+    for label, command in commands:
+        if not shutil.which(command[0]):
+            continue
+        try:
+            subprocess.run(command, input=text, text=True, check=True, capture_output=True)
+            return label
+        except (OSError, subprocess.SubprocessError) as exc:
+            errors.append(f"{label}: {exc}")
+
+    if errors:
+        raise RuntimeError(f"Failed to copy to clipboard ({'; '.join(errors)})")
+    raise RuntimeError("No supported clipboard command found (tried pbcopy, wl-copy, xclip, xsel, clip).")
+
+
 @cli.group()
 def genre():
     """Genre tagging commands."""
@@ -54,44 +81,54 @@ def genre():
     help="Spotify Client Secret (or set SPOTIFY_CLIENT_SECRET env var).",
 )
 @click.option(
+    "--discogs-token",
+    envvar="DISCOGS_TOKEN",
+    help="Discogs personal access token (or set DISCOGS_TOKEN env var).",
+)
+@click.option(
     "--source",
-    type=click.Choice(["spotify", "lastfm", "local"]),
-    default="spotify",
-    help="Primary genre source (default: spotify).",
+    type=click.Choice(["apple", "discogs", "spotify", "lastfm", "local", "all"]),
+    default="all",
+    help="Primary genre source (default: all = Apple→Discogs→Spotify→Last.fm→local).",
 )
 @click.option("--no-api", is_flag=True, help="Skip all API lookups, use local rules only.")
 @click.option("--verbose", "-v", is_flag=True, help="Show per-track classification details.")
-def genre_set(dry_run, force, lastfm_key, spotify_id, spotify_secret, source, no_api, verbose):
-    """Auto-tag genres using Spotify/Last.fm API with local rules as fallback."""
+def genre_set(dry_run, force, lastfm_key, spotify_id, spotify_secret, discogs_token, source, no_api, verbose):
+    """Auto-tag genres using Apple Music/Discogs/Spotify/Last.fm with local rules as fallback.
+
+    Priority order (--source=all): Apple Music → Discogs → Spotify → Last.fm → local rules.
+    """
     click.echo("Opening rekordbox database...")
     db = get_database()
 
     lastfm_client = None
     spotify_client = None
+    discogs_client = None
+    apple_client = None
 
     if not no_api:
-        if source == "spotify" and spotify_id and spotify_secret:
+        if source in ("all", "apple"):
+            from .apple_music import AppleMusicClient
+            apple_client = AppleMusicClient()
+            click.echo("Apple Music/iTunes API enabled (no key needed).")
+
+        if source in ("all", "discogs") and discogs_token:
+            from .discogs import DiscogsClient
+            discogs_client = DiscogsClient(discogs_token)
+            click.echo("Discogs API enabled.")
+
+        if source in ("all", "spotify") and spotify_id and spotify_secret:
             from .spotify import SpotifyClient
             spotify_client = SpotifyClient(spotify_id, spotify_secret)
-            click.echo("Spotify API enabled (primary).")
-        elif source == "lastfm" and lastfm_key:
+            click.echo("Spotify API enabled.")
+
+        if source in ("all", "lastfm") and lastfm_key:
             from .lastfm import LastFmClient
             lastfm_client = LastFmClient(lastfm_key)
-            click.echo("Last.fm API enabled (primary).")
-        elif source == "spotify" and not (spotify_id and spotify_secret):
-            click.echo(click.style(
-                "⚠ No Spotify credentials. Set SPOTIFY_CLIENT_ID/SECRET in .env or pass --spotify-id/--spotify-secret.",
-                fg="yellow",
-            ))
-            # Try Last.fm as fallback
-            if lastfm_key:
-                from .lastfm import LastFmClient
-                lastfm_client = LastFmClient(lastfm_key)
-                click.echo("Falling back to Last.fm API.")
-            else:
-                click.echo("Using local rules only.")
-        else:
-            click.echo("Using local rules only.")
+            click.echo("Last.fm API enabled.")
+
+        if not any([apple_client, discogs_client, spotify_client, lastfm_client]):
+            click.echo(click.style("⚠ No API clients available. Using local rules only.", fg="yellow"))
 
     click.echo("Classifying tracks...")
     result = set_genres(
@@ -100,6 +137,8 @@ def genre_set(dry_run, force, lastfm_key, spotify_id, spotify_secret, source, no
         force=force,
         lastfm_client=lastfm_client,
         spotify_client=spotify_client,
+        discogs_client=discogs_client,
+        apple_client=apple_client,
         verbose=verbose,
     )
     print_summary(result, dry_run=dry_run)
@@ -122,6 +161,34 @@ def genre_set(dry_run, force, lastfm_key, spotify_id, spotify_secret, source, no
         click.echo("Aborted.")
 
     db.close()
+
+
+@genre.command("sources")
+def genre_sources():
+    """Show available genre sources and their status."""
+    click.echo("\nGenre sources (priority order):\n")
+
+    sources = [
+        ("Apple Music", "No key needed (free iTunes API)", "Track-level genres: House, Urbano Latino, Música Tropical, etc."),
+        ("Discogs", "DISCOGS_TOKEN", "Styles: Cumbia Villera, Italo Disco, Deep House, etc."),
+        ("Spotify", "SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET", "Artist-level genres (broad)"),
+        ("Last.fm", "LASTFM_API_KEY", "Community tags (noisy but diverse)"),
+        ("Essentia", "No key needed (local ML)", "Audio analysis: energy, mood, danceability, BPM, key"),
+        ("Local rules", "None", "Playlist/artist/keyword matching"),
+    ]
+
+    for name, key_info, description in sources:
+        if key_info in ("No key needed (free iTunes API)", "No key needed (local ML)", "None"):
+            status = click.style("✓ Available", fg="green")
+        else:
+            keys = key_info.split(" + ")
+            available = all(os.environ.get(k) for k in keys)
+            status = click.style("✓ Configured", fg="green") if available else click.style("✗ Missing key", fg="red")
+
+        click.echo(f"  {status}  {name:<12s} — {description}")
+        if key_info not in ("No key needed (free iTunes API)", "No key needed (local ML)", "None"):
+            click.echo(f"             Key: {key_info}")
+    click.echo()
 
 
 @genre.command("show")
@@ -243,6 +310,100 @@ def enrich(dry_run, force, verbose, spotify_id, spotify_secret, lastfm_key):
         click.echo("Aborted.")
 
     db.close()
+
+
+@cli.group()
+def history():
+    """History commands."""
+    pass
+
+
+@history.command("latest")
+@click.option(
+    "--playlist-name",
+    default=None,
+    help="Name for the created playlist (default: 'History - <history name>').",
+)
+def history_latest(playlist_name):
+    """Copy latest history to clipboard, print it, and create a playlist from it."""
+    from pyrekordbox.db6.tables import DjmdHistory, DjmdSongHistory
+
+    db = get_database()
+    try:
+        histories = (
+            db.get_history()
+            .order_by(DjmdHistory.DateCreated.desc(), DjmdHistory.Seq.desc())
+            .all()
+        )
+        if not histories:
+            raise click.ClickException("No history entries found.")
+
+        latest_history = None
+        history_songs = []
+        for candidate in histories:
+            songs = (
+                db.get_history_songs(HistoryID=candidate.ID)
+                .order_by(DjmdSongHistory.TrackNo.asc())
+                .all()
+            )
+            if songs:
+                latest_history = candidate
+                history_songs = songs
+                break
+
+        if not latest_history:
+            raise click.ClickException("No history entries with tracks found.")
+
+        reference_time = history_songs[0].created_at or latest_history.DateCreated
+        track_lines = []
+        content_ids = []
+        for idx, song in enumerate(history_songs, start=1):
+            content = song.Content
+            artist = content.Artist.Name if content and content.Artist else "Unknown Artist"
+            title = content.Title if content and content.Title else "Unknown Title"
+            played_at = song.created_at or latest_history.DateCreated
+            elapsed = max(0, int((played_at - reference_time).total_seconds())) if (played_at and reference_time) else 0
+            if elapsed == 0:
+                elapsed_str = "0"
+            else:
+                hours, rem = divmod(elapsed, 3600)
+                minutes, seconds = divmod(rem, 60)
+                elapsed_str = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+            skipto = "0:00" if elapsed == 0 else elapsed_str
+            track_lines.append(f"{idx:02d}. [{elapsed_str}](#t={skipto}) {artist} - {title}")
+            content_ids.append(song.ContentID)
+
+        history_name = latest_history.Name or "Latest History"
+        history_text = "\n".join(track_lines)
+
+        click.echo(f"\n{history_name} ({len(track_lines)} tracks):\n")
+        click.echo(history_text)
+
+        clipboard_tool = _copy_to_clipboard(history_text)
+        click.echo(click.style(f"\n✓ Copied history to clipboard via {clipboard_tool}.", fg="green"))
+
+        desired_playlist_name = playlist_name or f"History - {history_name}"
+        existing_names = {p.Name for p in db.get_playlist().all() if p.Name}
+        final_playlist_name = desired_playlist_name
+        suffix = 2
+        while final_playlist_name in existing_names:
+            final_playlist_name = f"{desired_playlist_name} ({suffix})"
+            suffix += 1
+
+        playlist = db.create_playlist(final_playlist_name)
+        for track_no, content_id in enumerate(content_ids, start=1):
+            db.add_to_playlist(playlist, content_id, track_no=track_no)
+
+        backup = safe_commit(db, "history_playlist")
+        click.echo(
+            click.style(
+                f"✓ Created playlist '{final_playlist_name}' with {len(content_ids)} tracks.",
+                fg="green",
+            )
+        )
+        click.echo(f"  Backup at: {backup}")
+    finally:
+        db.close()
 
 
 @cli.group()
@@ -510,3 +671,127 @@ def spotify_missing(playlist_name, output):
             fg="green",
         ))
         click.echo(f"  Open: {new_playlist['external_urls']['spotify']}")
+
+
+@cli.command("analyze")
+@click.option("--dry-run", is_flag=True, help="Preview analysis without writing to DB.")
+@click.option("--limit", "-n", default=0, help="Max tracks to analyze (0 = all).")
+@click.option("--verbose", "-v", is_flag=True, help="Show per-track analysis details.")
+@click.option("--write-comments", is_flag=True, help="Write mood/energy tags to Comments field.")
+def analyze(dry_run, limit, verbose, write_comments):
+    """Analyze audio files with Essentia ML for energy, mood, danceability, and genre.
+
+    Results are displayed and optionally written to the Comments field.
+    """
+    from .essentia_analysis import EssentiaAnalyzer, AudioFeatures
+    from urllib.parse import unquote
+    from pathlib import Path as P
+
+    click.echo("Opening rekordbox database...")
+    db = get_database()
+    tracks = db.get_content().all()
+
+    # Filter to local files only
+    local_tracks = []
+    supported_exts = (".mp3", ".wav", ".flac", ".aiff", ".m4a")
+    for t in tracks:
+        path = t.FolderPath
+        if not path:
+            continue
+        if path.startswith("spotify:") or path.startswith("soundcloud:"):
+            continue
+        # Convert file URI to path
+        if path.startswith("file://localhost"):
+            path = unquote(path.replace("file://localhost", ""))
+        elif path.startswith("file://"):
+            path = unquote(path[7:])
+
+        base_path = P(path)
+        file_path = None
+
+        if base_path.exists() and base_path.is_file():
+            file_path = base_path
+        else:
+            file_name = t.FileNameL or t.FileNameS or ""
+            if file_name:
+                candidate = base_path / file_name
+                if candidate.exists() and candidate.is_file():
+                    file_path = candidate
+
+        if file_path and file_path.suffix.lower() in supported_exts:
+            local_tracks.append((t, str(file_path)))
+
+    click.echo(f"Found {len(local_tracks)} local audio files.")
+
+    if limit > 0:
+        local_tracks = local_tracks[:limit]
+        click.echo(f"Analyzing first {limit} tracks...")
+
+    analyzer = EssentiaAnalyzer()
+    results = []
+    analyzed = 0
+    failed = 0
+
+    with click.progressbar(local_tracks, label="Analyzing", show_pos=True) as bar:
+        for track, file_path in bar:
+            features = analyzer.analyze(file_path)
+            if features:
+                results.append((track, features))
+                analyzed += 1
+            else:
+                failed += 1
+
+    # Display results
+    click.echo(f"\n{'═' * 60}")
+    click.echo(f"  Analyzed: {analyzed} tracks  |  Failed: {failed}")
+    click.echo(f"{'═' * 60}\n")
+
+    if verbose:
+        for track, feat in results[:30]:
+            artist = track.Artist.Name if track.Artist else "?"
+            title = track.Title or "?"
+            click.echo(f"  {artist} - {title}")
+            click.echo(f"    BPM: {feat.bpm:.1f} | Energy: {feat.energy_level}/10 | "
+                       f"Dance: {feat.danceability:.2f} | Mood: {feat.mood or '?'}")
+            if feat.key:
+                click.echo(f"    Key: {feat.key} {feat.scale or ''}")
+            click.echo()
+
+    # Summary stats
+    if results:
+        avg_energy = sum(f.energy for _, f in results) / len(results)
+        avg_dance = sum(f.danceability for _, f in results) / len(results)
+        moods = {}
+        for _, f in results:
+            if f.mood:
+                moods[f.mood] = moods.get(f.mood, 0) + 1
+
+        click.echo(f"  Avg Energy: {avg_energy:.2f} ({round(avg_energy * 10)}/10)")
+        click.echo(f"  Avg Danceability: {avg_dance:.2f}")
+        if moods:
+            click.echo(f"  Mood distribution:")
+            for mood, count in sorted(moods.items(), key=lambda x: -x[1]):
+                click.echo(f"    {mood:<15s} {count:3d} tracks")
+
+    # Write to Comments if requested
+    if write_comments and not dry_run and results:
+        click.echo()
+        if click.confirm(f"Write mood/energy tags to Comments for {len(results)} tracks?"):
+            written = 0
+            for track, feat in results:
+                tag = feat.mood_tag
+                current = track.Commnt or ""
+                if tag not in current:
+                    # Append to existing comment
+                    new_comment = f"{current} [{tag}]".strip() if current else f"[{tag}]"
+                    track.Commnt = new_comment
+                    written += 1
+            if written:
+                backup = safe_commit(db, "analyze")
+                click.echo(click.style(f"✓ Written {written} comment tags. Backup: {backup}", fg="green"))
+            else:
+                click.echo("All tracks already have tags.")
+    elif write_comments and dry_run:
+        click.echo("\n[DRY RUN] Would write comment tags to tracks.")
+
+    db.close()

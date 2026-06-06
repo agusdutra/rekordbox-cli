@@ -24,6 +24,9 @@ rb genre set --force
 
 # Show genre distribution
 rb genre show
+
+# Copy latest rekordbox history to clipboard, show it, and create a playlist
+rb history latest
 ```
 
 ## How it works

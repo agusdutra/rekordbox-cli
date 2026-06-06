@@ -57,21 +57,26 @@ def get_or_create_genre(db, name: str, genre_cache: dict) -> DjmdGenre:
     return genre
 
 
-def set_genres(db, dry_run: bool = False, force: bool = False, lastfm_client=None, spotify_client=None, verbose: bool = False) -> dict:
+def set_genres(db, dry_run: bool = False, force: bool = False,
+               lastfm_client=None, spotify_client=None,
+               discogs_client=None, apple_client=None,
+               verbose: bool = False) -> dict:
     """Classify and tag genres on tracks.
 
-    Priority: Spotify API → Last.fm API → local rules.
+    Priority: Apple Music → Discogs → Spotify → Last.fm → local rules.
 
     Args:
         db: Rekordbox6Database instance.
         dry_run: If True, don't write changes.
         force: If True, re-tag all tracks (not just untagged).
-        lastfm_client: Optional LastFmClient for API-based lookups.
+        apple_client: Optional AppleMusicClient for iTunes lookups.
+        discogs_client: Optional DiscogsClient for style lookups.
         spotify_client: Optional SpotifyClient for API-based lookups.
+        lastfm_client: Optional LastFmClient for API-based lookups.
         verbose: If True, print per-track classification details.
 
     Returns:
-        dict with keys: total, assigned, unclassified, genre_counts, api_hits, local_hits
+        dict with keys: total, assigned, unclassified, genre_counts, source_counts, api_hits, local_hits
     """
     # Build playlist → track mapping
     playlist_songs = db.get_playlist_songs().all()
@@ -96,6 +101,7 @@ def set_genres(db, dry_run: bool = False, force: bool = False, lastfm_client=Non
     api_hits = 0
     local_hits = 0
     genre_counts = defaultdict(int)
+    source_counts = defaultdict(int)
 
     for i, t in enumerate(target):
         genre_name = None
@@ -103,21 +109,41 @@ def set_genres(db, dry_run: bool = False, force: bool = False, lastfm_client=Non
         artist = t.Artist.Name if t.Artist else ""
         title = t.Title or ""
 
-        # 1. Primary: Spotify API lookup
-        if spotify_client and (artist or title):
+        # 1. Apple Music/iTunes (track-level genre, great for Latin)
+        if not genre_name and apple_client and (artist or title):
+            try:
+                genre_name = apple_client.get_genre(artist, title)
+                if genre_name:
+                    api_hits += 1
+                    source = "apple"
+            except Exception:
+                pass
+
+        # 2. Discogs (great for Latin, vinyl, specific styles)
+        if not genre_name and discogs_client and (artist or title):
+            try:
+                genre_name = discogs_client.get_subgenre(artist, title)
+                if genre_name:
+                    api_hits += 1
+                    source = "discogs"
+            except Exception:
+                pass
+
+        # 3. Spotify (reliable artist-level genres)
+        if not genre_name and spotify_client and (artist or title):
             genre_name = spotify_client.get_genre(artist, title)
             if genre_name:
                 api_hits += 1
                 source = "spotify"
 
-        # 2. Secondary: Last.fm API lookup
+        # 4. Last.fm (community tags, noisy but diverse)
         if not genre_name and lastfm_client and (artist or title):
             genre_name = lastfm_client.get_genre(artist, title)
             if genre_name:
                 api_hits += 1
                 source = "lastfm"
 
-        # 3. Fallback: local playlist/artist/keyword rules
+        # 5. Local rules (playlist/artist/keyword matching)
         if not genre_name:
             pls = track_playlists.get(t.ID, [])
             genre_name = classify_track(t, pls)
@@ -127,6 +153,7 @@ def set_genres(db, dry_run: bool = False, force: bool = False, lastfm_client=Non
 
         if genre_name:
             genre_counts[genre_name] += 1
+            source_counts[source] += 1
             if not dry_run:
                 genre_obj = get_or_create_genre(db, genre_name, genre_cache)
                 t.GenreID = genre_obj.ID
@@ -144,6 +171,7 @@ def set_genres(db, dry_run: bool = False, force: bool = False, lastfm_client=Non
         "assigned": assigned,
         "unclassified": len(target) - assigned,
         "genre_counts": dict(genre_counts),
+        "source_counts": dict(source_counts),
         "api_hits": api_hits,
         "local_hits": local_hits,
     }
@@ -156,9 +184,12 @@ def print_summary(result: dict, dry_run: bool = False):
     click.echo(f"\n{prefix}Genre tagging results:")
     click.echo(f"  Tracks processed: {result['total']}")
     click.echo(click.style(f"  ✓ Assigned: {result['assigned']}", fg="green"))
-    if result.get("api_hits"):
-        click.echo(f"    ↳ via Last.fm: {result['api_hits']}")
-    if result.get("local_hits"):
+    if result.get("source_counts"):
+        for src, count in sorted(result["source_counts"].items(), key=lambda x: -x[1]):
+            click.echo(f"    ↳ via {src}: {count}")
+    elif result.get("api_hits"):
+        click.echo(f"    ↳ via API: {result['api_hits']}")
+    if result.get("local_hits") and not result.get("source_counts"):
         click.echo(f"    ↳ via local rules: {result['local_hits']}")
     click.echo(click.style(f"  ✗ Unclassified: {result['unclassified']}", fg="yellow"))
     click.echo()
