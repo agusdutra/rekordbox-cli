@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+from collections import defaultdict
 from pathlib import Path
 
 import click
@@ -54,6 +55,61 @@ def _copy_to_clipboard(text: str) -> str:
     if errors:
         raise RuntimeError(f"Failed to copy to clipboard ({'; '.join(errors)})")
     raise RuntimeError("No supported clipboard command found (tried pbcopy, wl-copy, xclip, xsel, clip).")
+
+
+def _find_rekordbox_playlist(playlists, playlist_name):
+    """Find first rekordbox playlist by case-insensitive fuzzy name match."""
+    for playlist in playlists:
+        name = playlist.Name or ""
+        if playlist_name.lower() in name.lower():
+            return playlist
+    return None
+
+
+def _parse_sort_priority(sort_by: str) -> list[str]:
+    """Parse and validate playlist sort priorities."""
+    priorities = [p.strip().lower() for p in sort_by.split(",") if p.strip()]
+    if len(priorities) != 3 or set(priorities) != {"genre", "key", "bpm"}:
+        raise click.ClickException(
+            "Invalid --by value. Use all fields once, e.g. 'genre,key,bpm' or 'bpm,key,genre'."
+        )
+    return priorities
+
+
+def _playlist_track_sort_fields(content):
+    """Extract normalized sortable fields from a rekordbox content entry."""
+    genre_name = content.Genre.Name.strip() if content and content.Genre and content.Genre.Name else ""
+    key_name = content.Key.ScaleName.strip() if content and content.Key and content.Key.ScaleName else ""
+    bpm_value = float(content.BPM) if content and content.BPM else None
+    artist = content.Artist.Name.strip() if content and content.Artist and content.Artist.Name else ""
+    title = content.Title.strip() if content and content.Title else ""
+
+    return {
+        "genre": genre_name,
+        "key": key_name,
+        "bpm": bpm_value,
+        "artist": artist,
+        "title": title,
+    }
+
+
+def _playlist_sort_key(fields: dict, priorities: list[str]):
+    """Build tuple sort key from selected priority order."""
+    parts = []
+    for priority in priorities:
+        if priority == "genre":
+            genre = fields["genre"].lower()
+            parts.append((0, genre) if genre else (1, ""))
+        elif priority == "key":
+            key = fields["key"].lower()
+            parts.append((0, key) if key else (1, ""))
+        elif priority == "bpm":
+            bpm = fields["bpm"]
+            parts.append((0, bpm) if bpm is not None else (1, float("inf")))
+
+    parts.append(fields["artist"].lower())
+    parts.append(fields["title"].lower())
+    return tuple(parts)
 
 
 @cli.group()
@@ -237,6 +293,91 @@ def genre_sync(dry_run, verbose):
     db.close()
 
 
+@cli.group()
+def playlist():
+    """Playlist commands."""
+    pass
+
+
+@playlist.command("sort")
+@click.argument("playlist_name")
+@click.option(
+    "--by",
+    "sort_by",
+    default="genre,key,bpm",
+    help="Sort priority using all of: genre,key,bpm (default: genre,key,bpm).",
+)
+@click.option("--dry-run", is_flag=True, help="Preview sorting without writing.")
+def playlist_sort(playlist_name, sort_by, dry_run):
+    """Sort a rekordbox playlist using genre, key, and BPM."""
+    from pyrekordbox.db6.tables import DjmdSongPlaylist
+
+    priorities = _parse_sort_priority(sort_by)
+
+    click.echo("Opening rekordbox database...")
+    db = get_database()
+    try:
+        playlists = db.get_playlist().all()
+        target_playlist = _find_rekordbox_playlist(playlists, playlist_name)
+        if not target_playlist:
+            click.echo(click.style(f"✗ Playlist '{playlist_name}' not found.", fg="red"))
+            click.echo("Available playlists:")
+            for pl in playlists:
+                if pl.Name:
+                    click.echo(f"  {pl.Name}")
+            return
+
+        playlist_songs = (
+            db.get_playlist_songs(PlaylistID=target_playlist.ID)
+            .order_by(DjmdSongPlaylist.TrackNo.asc())
+            .all()
+        )
+        if not playlist_songs:
+            click.echo(click.style(f"✗ Playlist '{target_playlist.Name}' has no tracks.", fg="red"))
+            return
+
+        sortable_rows = []
+        for ps in playlist_songs:
+            fields = _playlist_track_sort_fields(ps.Content)
+            sortable_rows.append(
+                {
+                    "song": ps,
+                    "fields": fields,
+                    "sort_key": _playlist_sort_key(fields, priorities),
+                }
+            )
+
+        sorted_rows = sorted(sortable_rows, key=lambda row: row["sort_key"])
+        changed = sum(1 for new_pos, row in enumerate(sorted_rows, start=1) if row["song"].TrackNo != new_pos)
+
+        click.echo(f"\nPlaylist: {target_playlist.Name}")
+        click.echo(f"Tracks: {len(sorted_rows)}")
+        click.echo(f"Sort order: {', '.join(priorities)}")
+        click.echo(f"Tracks moved: {changed}")
+
+        if changed == 0:
+            click.echo("\nPlaylist is already sorted.")
+            return
+
+        if dry_run:
+            click.echo("\nNo changes written (dry run).")
+            return
+
+        click.echo()
+        if not click.confirm(f"Apply sorted order to '{target_playlist.Name}'?"):
+            click.echo("Aborted.")
+            return
+
+        for new_pos, row in enumerate(sorted_rows, start=1):
+            row["song"].TrackNo = new_pos
+
+        backup = safe_commit(db, "playlist_sort")
+        click.echo(click.style(f"\n✓ Sorted playlist '{target_playlist.Name}'.", fg="green"))
+        click.echo(f"  Backup at: {backup}")
+    finally:
+        db.close()
+
+
 @cli.command("enrich")
 @click.option("--dry-run", is_flag=True, help="Preview changes without writing.")
 @click.option("--force", is_flag=True, help="Update all tracks, not just incomplete ones.")
@@ -412,6 +553,41 @@ def spotify():
     pass
 
 
+def _find_spotify_playlist(playlists, playlist_name):
+    """Find first Spotify playlist by case-insensitive fuzzy name match."""
+    for playlist in playlists:
+        if playlist_name.lower() in playlist["name"].lower():
+            return playlist
+    return None
+
+
+def _normalize_track_title(title: str) -> str:
+    """Normalize track title for matching."""
+    return (title or "").lower().strip()
+
+
+def _clean_track_title(title: str) -> str:
+    """Remove common remix/version suffixes for looser matching."""
+    normalized = _normalize_track_title(title)
+    return normalized.split("(")[0].split("[")[0].strip()
+
+
+def _build_local_content_index(local_tracks):
+    """Build artist+title index for rekordbox content objects."""
+    index = defaultdict(list)
+    for track in local_tracks:
+        artist = (track.Artist.Name if track.Artist else "").lower().strip()
+        title = _normalize_track_title(track.Title or "")
+        if not artist or not title:
+            continue
+
+        clean_title = _clean_track_title(title)
+        index[(artist, title)].append(track)
+        if clean_title and clean_title != title:
+            index[(artist, clean_title)].append(track)
+    return index
+
+
 @spotify.command("login")
 def spotify_login():
     """Authenticate with Spotify (opens browser for OAuth)."""
@@ -434,6 +610,97 @@ def spotify_playlists():
     click.echo(f"\nYour Spotify playlists ({len(playlists)}):\n")
     for pl in playlists:
         click.echo(f"  {pl['tracks']['total']:4d} tracks  {pl['name']}")
+
+
+@spotify.command("to-rekordbox")
+@click.argument("playlist_name")
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Name for the rekordbox playlist (default: 'Spotify - <source>').",
+)
+@click.option("--dry-run", is_flag=True, help="Preview without writing to rekordbox.")
+def spotify_to_rekordbox(playlist_name, output, dry_run):
+    """Create a rekordbox playlist using tracks already present locally from a Spotify playlist."""
+    from .spotify_user import get_spotify_user_client, get_user_playlists, get_playlist_tracks
+
+    click.echo("Connecting to Spotify...")
+    sp = get_spotify_user_client()
+    playlists = get_user_playlists(sp)
+
+    match = _find_spotify_playlist(playlists, playlist_name)
+    if not match:
+        click.echo(click.style(f"✗ Playlist '{playlist_name}' not found.", fg="red"))
+        click.echo("Available playlists:")
+        for pl in playlists:
+            click.echo(f"  {pl['name']}")
+        return
+
+    click.echo(f"Source playlist: {match['name']} ({match['tracks']['total']} tracks)")
+    click.echo("Fetching Spotify tracks...")
+    spotify_tracks = get_playlist_tracks(sp, match["id"])
+
+    click.echo("Loading rekordbox library...")
+    db = get_database()
+    try:
+        local_tracks = db.get_content().all()
+        local_index = _build_local_content_index(local_tracks)
+
+        matched_tracks = []
+        matched_ids = set()
+        missing_count = 0
+
+        for sp_track in spotify_tracks:
+            sp_artist = (sp_track["artists"][0]["name"] if sp_track.get("artists") else "").lower().strip()
+            sp_title = _normalize_track_title(sp_track.get("name", ""))
+            sp_clean_title = _clean_track_title(sp_title)
+
+            candidates = local_index.get((sp_artist, sp_title), [])
+            if not candidates and sp_clean_title:
+                candidates = local_index.get((sp_artist, sp_clean_title), [])
+
+            local_match = next((track for track in candidates if track.ID not in matched_ids), None)
+            if local_match:
+                matched_tracks.append(local_match)
+                matched_ids.add(local_match.ID)
+            else:
+                missing_count += 1
+
+        if not matched_tracks:
+            click.echo(click.style("\n✗ No Spotify tracks were found in your local rekordbox collection.", fg="red"))
+            return
+
+        output_name = output or f"Spotify - {match['name']}"
+        existing_names = {p.Name for p in db.get_playlist().all() if p.Name}
+        final_name = output_name
+        suffix = 2
+        while final_name in existing_names:
+            final_name = f"{output_name} ({suffix})"
+            suffix += 1
+
+        click.echo(f"\nMatched local tracks: {len(matched_tracks)}")
+        click.echo(f"Missing from local collection: {missing_count}")
+        click.echo(f"Target rekordbox playlist: {final_name}")
+
+        if dry_run:
+            click.echo("\nNo changes written (dry run).")
+            return
+
+        click.echo()
+        if not click.confirm(f"Create rekordbox playlist '{final_name}' with {len(matched_tracks)} tracks?"):
+            click.echo("Aborted.")
+            return
+
+        playlist = db.create_playlist(final_name)
+        for track_no, content in enumerate(matched_tracks, start=1):
+            db.add_to_playlist(playlist, content.ID, track_no=track_no)
+
+        backup = safe_commit(db, "spotify_to_rekordbox")
+        click.echo(click.style(f"\n✓ Created rekordbox playlist '{final_name}' with {len(matched_tracks)} tracks.", fg="green"))
+        click.echo(f"  Backup at: {backup}")
+    finally:
+        db.close()
 
 
 @spotify.command("diff")

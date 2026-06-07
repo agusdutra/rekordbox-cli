@@ -42,6 +42,7 @@ Run commands through the `rb` entry point:
 rb --help
 rb genre --help
 rb spotify --help
+rb playlist --help
 ```
 
 ### Genre tagging
@@ -90,6 +91,17 @@ rb history latest --playlist-name "My Set History"
 
 This prints the latest playback history, copies it to your clipboard, and creates a playlist from the tracks.
 
+### Playlist tools
+
+```bash
+rb playlist sort "playlist name"
+rb playlist sort "playlist name" --by "genre,key,bpm"
+rb playlist sort "playlist name" --by "bpm,key,genre"
+rb playlist sort "playlist name" --dry-run
+```
+
+This sorts a rekordbox playlist using genre, key, and BPM. Use `--by` to choose the priority order.
+
 ### Spotify tools
 
 ```bash
@@ -98,9 +110,12 @@ rb spotify playlists
 rb spotify diff "playlist name"
 rb spotify missing "playlist name"
 rb spotify missing "playlist name" --output "Missing Tracks"
+rb spotify to-rekordbox "playlist name"
+rb spotify to-rekordbox "playlist name" --output "RB Playlist Name"
+rb spotify to-rekordbox "playlist name" --dry-run
 ```
 
-Use these commands to compare Spotify playlists with your local rekordbox library or create a Spotify playlist of missing tracks.
+Use these commands to compare Spotify playlists with your local rekordbox library, create a Spotify playlist of missing tracks, or create a rekordbox playlist from Spotify tracks that are already in your local collection.
 
 ## Safety
 
