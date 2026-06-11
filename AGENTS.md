@@ -10,6 +10,7 @@ Public repo: https://github.com/agusdutra/rekordbox-cli
 
 - `rb genre set`, `rb genre show`, `rb genre sources`, `rb genre sync`
 - `rb playlist sort`
+- `rb collection dedupe`
 - `rb enrich`
 - `rb analyze`
 - `rb history latest`
@@ -44,6 +45,10 @@ rb genre set --force
 rb genre show
 rb genre sync --dry-run
 rb playlist sort "playlist name" --dry-run
+rb playlist sort "folder/playlist name"
+rb playlist sort "playlist name" --verbose
+rb collection dedupe --dry-run
+rb collection dedupe --dry-run --include-tentative --verbose
 rb enrich --dry-run
 rb analyze -n 100
 rb history latest

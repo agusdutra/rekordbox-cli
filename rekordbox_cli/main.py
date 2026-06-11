@@ -1,10 +1,13 @@
 """rekordbox-cli: CLI entry point."""
 
+import inspect
 import os
 import shutil
 import subprocess
 from collections import defaultdict
+from os.path import normpath
 from pathlib import Path
+from urllib.parse import unquote
 
 import click
 
@@ -57,13 +60,49 @@ def _copy_to_clipboard(text: str) -> str:
     raise RuntimeError("No supported clipboard command found (tried pbcopy, wl-copy, xclip, xsel, clip).")
 
 
-def _find_rekordbox_playlist(playlists, playlist_name):
-    """Find first rekordbox playlist by case-insensitive fuzzy name match."""
+def _playlist_path(playlist, playlists_by_id):
+    """Build full folder path for a rekordbox playlist."""
+    parts = []
+    current = playlist
+    seen_ids = set()
+    while current and current.ID not in seen_ids:
+        seen_ids.add(current.ID)
+        if current.Name:
+            parts.append(current.Name)
+        parent_id = getattr(current, "ParentID", None)
+        current = playlists_by_id.get(parent_id) if parent_id else None
+    return "/".join(reversed(parts))
+
+
+def _find_rekordbox_playlist(playlists, playlist_lookup):
+    """Find a rekordbox playlist by full path or fuzzy name."""
+    playlists_by_id = {p.ID: p for p in playlists}
+    searchable = []
     for playlist in playlists:
-        name = playlist.Name or ""
-        if playlist_name.lower() in name.lower():
-            return playlist
-    return None
+        full_path = _playlist_path(playlist, playlists_by_id)
+        searchable.append((playlist, full_path, full_path.lower(), (playlist.Name or "").lower()))
+
+    lookup = playlist_lookup.strip().lower()
+    if "/" in lookup:
+        exact_path_matches = [entry for entry in searchable if entry[2] == lookup]
+        if len(exact_path_matches) == 1:
+            return exact_path_matches[0][0], None
+        if len(exact_path_matches) > 1:
+            return None, [entry[1] for entry in exact_path_matches]
+
+        fuzzy_path_matches = [entry for entry in searchable if lookup in entry[2]]
+        if len(fuzzy_path_matches) == 1:
+            return fuzzy_path_matches[0][0], None
+        if len(fuzzy_path_matches) > 1:
+            return None, [entry[1] for entry in fuzzy_path_matches]
+        return None, None
+
+    name_matches = [entry for entry in searchable if lookup in entry[3]]
+    if len(name_matches) == 1:
+        return name_matches[0][0], None
+    if len(name_matches) > 1:
+        return None, [entry[1] for entry in name_matches]
+    return None, None
 
 
 def _parse_sort_priority(sort_by: str) -> list[str]:
@@ -110,6 +149,113 @@ def _playlist_sort_key(fields: dict, priorities: list[str]):
     parts.append(fields["artist"].lower())
     parts.append(fields["title"].lower())
     return tuple(parts)
+
+
+def _normalize_collection_path(folder_path: str) -> str | None:
+    """Normalize rekordbox folder path for conservative duplicate detection."""
+    if not folder_path:
+        return None
+
+    path = folder_path.strip()
+    if not path:
+        return None
+
+    if path.startswith("file://localhost"):
+        path = unquote(path.replace("file://localhost", ""))
+    elif path.startswith("file://"):
+        path = unquote(path[7:])
+
+    if path.startswith(("spotify:", "soundcloud:")):
+        return None
+
+    return normpath(path)
+
+
+def _collection_track_key(track) -> tuple[str | None, str]:
+    """Build duplicate-detection key for a collection track."""
+    raw_folder_path = (track.FolderPath or "").strip()
+    if not raw_folder_path:
+        return None, "missing-folder-path"
+
+    normalized_folder = _normalize_collection_path(raw_folder_path)
+    if not normalized_folder:
+        return None, "unsupported-path"
+
+    file_name = (track.FileNameL or track.FileNameS or "").strip()
+    base = Path(normalized_folder)
+    if base.suffix:
+        return normalized_folder, "file-path"
+
+    if file_name:
+        return normpath(str(base / file_name)), "folder-plus-filename"
+
+    return normalized_folder, "folder-only"
+
+
+def _tentative_track_key(track) -> tuple[tuple[str, str] | None, str]:
+    """Build tentative duplicate key using artist+title metadata."""
+    artist = (track.Artist.Name if track.Artist and track.Artist.Name else "").strip().lower()
+    title = (track.Title or "").strip().lower()
+    if not artist or not title:
+        return None, "tentative-missing-artist-title"
+    return (artist, title), "tentative-artist-title"
+
+
+def _track_metadata_score(track) -> int:
+    """Score content completeness for keeper selection."""
+    score = 0
+    if track.Title:
+        score += 1
+    if track.Artist:
+        score += 1
+    if track.Album:
+        score += 1
+    if track.Genre:
+        score += 1
+    if track.Key:
+        score += 1
+    if track.BPM:
+        score += 1
+    if track.Commnt:
+        score += 1
+    return score
+
+
+def _content_reference_tables():
+    """Discover ORM tables that reference ContentID."""
+    from pyrekordbox.db6 import tables as db_tables
+    from pyrekordbox.db6.tables import DjmdContent
+
+    refs = []
+    for _, cls in inspect.getmembers(db_tables, inspect.isclass):
+        if not hasattr(cls, "__table__") or cls is DjmdContent:
+            continue
+        table = cls.__table__
+        if "ContentID" in table.columns:
+            refs.append(cls)
+    return refs
+
+
+def _choose_keeper(tracks: list, ref_counts: dict) -> tuple:
+    """Choose the canonical track to keep from duplicates."""
+    def _stock_date_order(track):
+        value = getattr(track, "StockDate", None)
+        if not value:
+            return float("-inf")
+        try:
+            return -value.timestamp()
+        except Exception:
+            return float("-inf")
+
+    return max(
+        tracks,
+        key=lambda t: (
+            ref_counts.get(t.ID, 0),
+            _track_metadata_score(t),
+            _stock_date_order(t),
+            -int(t.ID),
+        ),
+    )
 
 
 @cli.group()
@@ -299,6 +445,43 @@ def playlist():
     pass
 
 
+@playlist.command("list")
+@click.option("--counts", "-c", is_flag=True, help="Show track count per playlist.")
+def playlist_list(counts):
+    """List all local playlists and folders as a tree."""
+    db = get_database()
+    all_playlists = db.get_playlist().all()
+
+    if counts:
+        from collections import Counter
+        songs = db.get_playlist_songs().all()
+        track_counts = Counter(s.PlaylistID for s in songs)
+
+    by_parent = {}
+    for p in all_playlists:
+        by_parent.setdefault(p.ParentID, []).append(p)
+
+    def _print_tree(parent_id, indent=0):
+        children = sorted(by_parent.get(parent_id, []), key=lambda p: (p.Attribute != 1, p.Seq or 0, p.Name or ""))
+        for p in children:
+            is_folder = p.Attribute == 1
+            prefix = "  " * indent
+            if is_folder:
+                click.echo(click.style(f"{prefix}📁 {p.Name}", fg="cyan", bold=True))
+                _print_tree(p.ID, indent + 1)
+            else:
+                if counts:
+                    n = track_counts.get(p.ID, 0)
+                    click.echo(f"{prefix}▸ {p.Name}  ({n})")
+                else:
+                    click.echo(f"{prefix}▸ {p.Name}")
+
+    click.echo()
+    _print_tree("root")
+    click.echo()
+    db.close()
+
+
 @playlist.command("sort")
 @click.argument("playlist_name")
 @click.option(
@@ -308,7 +491,8 @@ def playlist():
     help="Sort priority using all of: genre,key,bpm (default: genre,key,bpm).",
 )
 @click.option("--dry-run", is_flag=True, help="Preview sorting without writing.")
-def playlist_sort(playlist_name, sort_by, dry_run):
+@click.option("--verbose", "-v", is_flag=True, help="Show sorted track list in console.")
+def playlist_sort(playlist_name, sort_by, dry_run, verbose):
     """Sort a rekordbox playlist using genre, key, and BPM."""
     from pyrekordbox.db6.tables import DjmdSongPlaylist
 
@@ -318,13 +502,21 @@ def playlist_sort(playlist_name, sort_by, dry_run):
     db = get_database()
     try:
         playlists = db.get_playlist().all()
-        target_playlist = _find_rekordbox_playlist(playlists, playlist_name)
+        target_playlist, ambiguous_paths = _find_rekordbox_playlist(playlists, playlist_name)
+        if ambiguous_paths:
+            click.echo(click.style(f"✗ Playlist '{playlist_name}' is ambiguous. Use a full path.", fg="red"))
+            click.echo("Matching playlists:")
+            for path in sorted(set(ambiguous_paths)):
+                click.echo(f"  {path}")
+            return
+
         if not target_playlist:
             click.echo(click.style(f"✗ Playlist '{playlist_name}' not found.", fg="red"))
-            click.echo("Available playlists:")
+            click.echo("Available playlists (use folder/playlist):")
+            playlists_by_id = {p.ID: p for p in playlists}
             for pl in playlists:
                 if pl.Name:
-                    click.echo(f"  {pl.Name}")
+                    click.echo(f"  {_playlist_path(pl, playlists_by_id)}")
             return
 
         playlist_songs = (
@@ -355,6 +547,22 @@ def playlist_sort(playlist_name, sort_by, dry_run):
         click.echo(f"Sort order: {', '.join(priorities)}")
         click.echo(f"Tracks moved: {changed}")
 
+        if dry_run or verbose:
+            click.echo("\nSorted playlist order:")
+            for new_pos, row in enumerate(sorted_rows, start=1):
+                old_pos = row["song"].TrackNo
+                marker = "↺" if old_pos != new_pos else " "
+                fields = row["fields"]
+                artist = fields["artist"] or "Unknown Artist"
+                title = fields["title"] or "Unknown Title"
+                genre = fields["genre"] or "-"
+                key_name = fields["key"] or "-"
+                bpm_display = f"{fields['bpm']:.1f}" if fields["bpm"] is not None else "-"
+                click.echo(
+                    f" {marker} {new_pos:03d} (was {old_pos:03d})  "
+                    f"[{genre} | {key_name} | {bpm_display}]  {artist} - {title}"
+                )
+
         if changed == 0:
             click.echo("\nPlaylist is already sorted.")
             return
@@ -378,10 +586,211 @@ def playlist_sort(playlist_name, sort_by, dry_run):
         db.close()
 
 
+@cli.group()
+def collection():
+    """Collection commands."""
+    pass
+
+
+@collection.command("dedupe")
+@click.option("--dry-run", is_flag=True, help="Preview duplicate cleanup without writing.")
+@click.option("--verbose", "-v", is_flag=True, help="Show per-duplicate and per-table details.")
+@click.option(
+    "--include-tentative",
+    is_flag=True,
+    help="Also dedupe likely duplicates by artist+title (less strict than path matching).",
+)
+def collection_dedupe(dry_run, verbose, include_tentative):
+    """Remove duplicate collection tracks and remap references to the kept track."""
+    from pyrekordbox.db6.tables import DjmdContent
+
+    click.echo("Opening rekordbox database...")
+    db = get_database()
+    try:
+        tracks = db.get_content().all()
+        by_path = defaultdict(list)
+        by_tentative = defaultdict(list)
+        detection_reasons = defaultdict(int)
+
+        for track in tracks:
+            collection_key, reason = _collection_track_key(track)
+            detection_reasons[reason] += 1
+            if collection_key:
+                by_path[collection_key].append(track)
+            if include_tentative:
+                tentative_key, tentative_reason = _tentative_track_key(track)
+                detection_reasons[tentative_reason] += 1
+                if tentative_key:
+                    by_tentative[tentative_key].append(track)
+
+        duplicate_groups = {path: items for path, items in by_path.items() if len(items) > 1}
+        tentative_groups = {}
+        if include_tentative:
+            tracks_in_path_groups = {
+                t.ID
+                for group in duplicate_groups.values()
+                for t in group
+            }
+            tentative_groups = {
+                key: [t for t in items if t.ID not in tracks_in_path_groups]
+                for key, items in by_tentative.items()
+                if len([t for t in items if t.ID not in tracks_in_path_groups]) > 1
+            }
+            duplicate_groups.update({f"tentative::{k}": v for k, v in tentative_groups.items()})
+
+        click.echo("\nDuplicate detection:")
+        click.echo(f"  Tracks scanned: {len(tracks)}")
+        click.echo(f"  Tracks keyed by path: {sum(detection_reasons[r] for r in ('file-path', 'folder-plus-filename', 'folder-only'))}")
+        if include_tentative:
+            click.echo(f"  Tracks keyed by tentative metadata: {detection_reasons['tentative-artist-title']}")
+        click.echo(f"  Unique path keys: {len(by_path)}")
+        if include_tentative:
+            click.echo(f"  Unique tentative keys: {len(by_tentative)}")
+        click.echo(f"  Duplicate path keys: {len([k for k in duplicate_groups if not str(k).startswith('tentative::')])}")
+        if include_tentative:
+            click.echo(f"  Duplicate tentative keys: {len(tentative_groups)}")
+        click.echo(f"  Total duplicate groups: {len(duplicate_groups)}")
+
+        if verbose:
+            click.echo("  Key source breakdown:")
+            for reason, count in sorted(detection_reasons.items()):
+                click.echo(f"    {reason:<22s} {count}")
+
+        if not duplicate_groups:
+            if include_tentative:
+                click.echo("\nNo duplicates found by path or tentative metadata keys.")
+            else:
+                click.echo("\nNo duplicates found by file path key.")
+            if verbose:
+                metadata_groups = defaultdict(list)
+                for track in tracks:
+                    artist = (track.Artist.Name.strip().lower() if track.Artist and track.Artist.Name else "")
+                    title = (track.Title or "").strip().lower()
+                    if artist and title:
+                        metadata_groups[(artist, title)].append(track)
+                candidate_groups = [group for group in metadata_groups.values() if len(group) > 1]
+                if candidate_groups:
+                    click.echo("\nPotential duplicates by artist+title (diagnostic):")
+                    for group in sorted(candidate_groups, key=len, reverse=True)[:15]:
+                        sample = group[0]
+                        artist = sample.Artist.Name if sample.Artist else "?"
+                        title = sample.Title or "?"
+                        ids = ", ".join(str(t.ID) for t in group[:8])
+                        suffix = " ..." if len(group) > 8 else ""
+                        click.echo(f"  {len(group):2d}x  {artist} - {title}  [IDs: {ids}{suffix}]")
+            return
+
+        duplicate_ids = {
+            t.ID
+            for group in duplicate_groups.values()
+            for t in group
+        }
+
+        ref_tables = _content_reference_tables()
+        ref_counts = defaultdict(int)
+        for table_cls in ref_tables:
+            rows = db.session.query(table_cls).filter(table_cls.ContentID.in_(duplicate_ids)).all()
+            for row in rows:
+                ref_counts[row.ContentID] += 1
+
+        keep_by_duplicate_id = {}
+        groups_summary = []
+        for path, group_tracks in duplicate_groups.items():
+            keeper = _choose_keeper(group_tracks, ref_counts)
+            duplicates = [t for t in group_tracks if t.ID != keeper.ID]
+            for duplicate in duplicates:
+                keep_by_duplicate_id[duplicate.ID] = keeper
+            groups_summary.append((path, keeper, duplicates))
+
+        if not keep_by_duplicate_id:
+            click.echo("No duplicates found.")
+            return
+
+        updates_by_table = defaultdict(int)
+        remapped_preview = []
+        rows_to_update = []
+
+        for table_cls in ref_tables:
+            rows = db.session.query(table_cls).filter(table_cls.ContentID.in_(keep_by_duplicate_id.keys())).all()
+            for row in rows:
+                keeper = keep_by_duplicate_id.get(row.ContentID)
+                if not keeper or row.ContentID == keeper.ID:
+                    continue
+
+                updates_by_table[table_cls.__name__] += 1
+                rows_to_update.append((table_cls, row, keeper))
+                if verbose and len(remapped_preview) < 30:
+                    remapped_preview.append(f"{table_cls.__name__}: {row.ContentID} -> {keeper.ID}")
+
+        deleted = len(keep_by_duplicate_id)
+
+        click.echo("\nDuplicate cleanup summary:")
+        click.echo(f"  Duplicate groups: {len(groups_summary)}")
+        click.echo(f"  Tracks to remove: {len(keep_by_duplicate_id)}")
+        click.echo(f"  Reference updates: {sum(updates_by_table.values())}")
+
+        if verbose:
+            click.echo("\nDuplicate groups:")
+            for path, keeper, duplicates in groups_summary:
+                if str(path).startswith("tentative::"):
+                    click.echo(f"  Tentative key: {str(path).replace('tentative::', '')}")
+                else:
+                    click.echo(f"  Path: {path}")
+                click.echo(f"    Keep: {keeper.ID}  {(keeper.Artist.Name if keeper.Artist else '?')} - {keeper.Title or '?'}")
+                for duplicate in duplicates:
+                    click.echo(f"    Drop: {duplicate.ID}  {(duplicate.Artist.Name if duplicate.Artist else '?')} - {duplicate.Title or '?'}")
+
+            if updates_by_table:
+                click.echo("\nReference updates by table:")
+                for table_name, count in sorted(updates_by_table.items()):
+                    click.echo(f"  {table_name:<26s} {count}")
+            if remapped_preview:
+                click.echo("\nReference remap preview:")
+                for line in remapped_preview:
+                    click.echo(f"  {line}")
+
+        if dry_run:
+            click.echo("\nNo changes written (dry run).")
+            return
+
+        click.echo()
+        if not click.confirm(f"Remove {len(keep_by_duplicate_id)} duplicate tracks and apply reference updates?"):
+            db.session.rollback()
+            click.echo("Aborted.")
+            return
+
+        for table_cls, row, keeper in rows_to_update:
+            row.ContentID = keeper.ID
+            if hasattr(table_cls, "ContentUUID"):
+                row.ContentUUID = keeper.UUID if getattr(keeper, "UUID", None) else None
+
+        removed = 0
+        for duplicate_id in keep_by_duplicate_id:
+            duplicate_track = db.session.get(DjmdContent, duplicate_id)
+            if duplicate_track is not None:
+                db.session.delete(duplicate_track)
+                removed += 1
+
+        try:
+            backup = safe_commit(db, "collection_dedupe")
+        except Exception:
+            db.session.rollback()
+            raise
+
+        click.echo(click.style(f"\n✓ Removed {removed} duplicate tracks.", fg="green"))
+        click.echo(f"  Backup at: {backup}")
+    finally:
+        db.close()
+
+
 @cli.command("enrich")
 @click.option("--dry-run", is_flag=True, help="Preview changes without writing.")
 @click.option("--force", is_flag=True, help="Update all tracks, not just incomplete ones.")
 @click.option("--verbose", "-v", is_flag=True, help="Show per-track details.")
+@click.option(
+    "--playlist", "-p", "playlist_name", default=None,
+    help="Restrict enrichment to tracks in this playlist (fuzzy match).",
+)
 @click.option(
     "--spotify-id", envvar="SPOTIFY_CLIENT_ID",
     help="Spotify Client ID (or set SPOTIFY_CLIENT_ID env var).",
@@ -394,12 +803,27 @@ def playlist_sort(playlist_name, sort_by, dry_run):
     "--lastfm-key", envvar="LASTFM_API_KEY",
     help="Last.fm API key (or set LASTFM_API_KEY env var).",
 )
-def enrich(dry_run, force, verbose, spotify_id, spotify_secret, lastfm_key):
+def enrich(dry_run, force, verbose, playlist_name, spotify_id, spotify_secret, lastfm_key):
     """Fix and enrich track metadata (title, artist, album, year, label) from Spotify/Last.fm."""
     from .enrich import enrich_tracks, print_enrich_summary
 
     click.echo("Opening rekordbox database...")
     db = get_database()
+
+    playlist_content_ids = None
+    if playlist_name:
+        all_playlists = db.get_playlist().all()
+        matches = [p for p in all_playlists if playlist_name.lower() in (p.Name or "").lower()]
+        if not matches:
+            available = ", ".join(p.Name for p in all_playlists if p.Name)
+            click.echo(click.style(f"✗ Playlist '{playlist_name}' not found.", fg="red"))
+            click.echo(f"Available: {available}")
+            db.close()
+            return
+        playlist_obj = matches[0]
+        songs = db.get_playlist_songs(PlaylistID=playlist_obj.ID).all()
+        playlist_content_ids = {s.ContentID for s in songs}
+        click.echo(f"Filtering to playlist '{playlist_obj.Name}' ({len(playlist_content_ids)} tracks).")
 
     spotify_client = None
     lastfm_client = None
@@ -430,6 +854,7 @@ def enrich(dry_run, force, verbose, spotify_id, spotify_secret, lastfm_key):
         dry_run=dry_run,
         verbose=verbose,
         force=force,
+        playlist_content_ids=playlist_content_ids,
     )
     print_enrich_summary(result, dry_run=dry_run)
 

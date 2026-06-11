@@ -12,7 +12,8 @@ from .lastfm import LastFmClient
 
 
 def enrich_tracks(db, spotify_client: SpotifyClient = None, lastfm_client: LastFmClient = None,
-                  dry_run: bool = False, verbose: bool = False, force: bool = False) -> dict:
+                  dry_run: bool = False, verbose: bool = False, force: bool = False,
+                  playlist_content_ids: set = None) -> dict:
     """Enrich track metadata from Spotify/Last.fm APIs.
 
     Fixes: Title, Artist, Album, Label, Year, BPM, Key, Duration.
@@ -24,11 +25,16 @@ def enrich_tracks(db, spotify_client: SpotifyClient = None, lastfm_client: LastF
         dry_run: If True, don't write changes.
         verbose: If True, print per-track details.
         force: If True, update all tracks (not just ones with missing data).
+        playlist_content_ids: If set, only enrich tracks whose ID is in this set.
 
     Returns:
         dict with stats.
     """
     tracks = db.get_content().all()
+
+    # Restrict to playlist if given
+    if playlist_content_ids is not None:
+        tracks = [t for t in tracks if t.ID in playlist_content_ids]
 
     # Target tracks that need enrichment
     if force:

@@ -18,6 +18,8 @@ Command-line tools for managing and enriching a rekordbox 6/7 library through th
 ```bash
 git clone https://github.com/agusdutra/rekordbox-cli.git
 cd rekordbox-cli
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 ```
 
@@ -43,6 +45,7 @@ rb --help
 rb genre --help
 rb spotify --help
 rb playlist --help
+rb collection --help
 ```
 
 ### Genre tagging
@@ -95,12 +98,25 @@ This prints the latest playback history, copies it to your clipboard, and create
 
 ```bash
 rb playlist sort "playlist name"
+rb playlist sort "Boda Majo/playlist name"
 rb playlist sort "playlist name" --by "genre,key,bpm"
 rb playlist sort "playlist name" --by "bpm,key,genre"
 rb playlist sort "playlist name" --dry-run
+rb playlist sort "playlist name" --verbose
 ```
 
-This sorts a rekordbox playlist using genre, key, and BPM. Use `--by` to choose the priority order.
+This sorts a rekordbox playlist using genre, key, and BPM. Use `--by` to choose the priority order. Folder paths are supported with `folder/playlist`. With `--dry-run` or `--verbose`, the sorted track list is printed in the console.
+
+### Collection tools
+
+```bash
+rb collection dedupe --dry-run
+rb collection dedupe
+rb collection dedupe --verbose
+rb collection dedupe --dry-run --include-tentative --verbose
+```
+
+This removes duplicate collection entries (same local file key), rewires dependent references to the kept track, and then deletes duplicates. Use `--verbose` to print detection diagnostics and candidate duplicate groups. Add `--include-tentative` to also consider likely duplicates by artist+title.
 
 ### Spotify tools
 
