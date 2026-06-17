@@ -19,7 +19,6 @@ PLAYLIST_GENRE = {
     "Lentos": "Balada",
     "Oldies": "Oldies",
     "oldies ": "Oldies",
-    "Open (Internacional, EDM, Latin Remix)": "EDM",
     "Regaeton": "Reggaeton",
     "Reggaeton": "Reggaeton",
     "Remixes Latinos": "Latin Remix",

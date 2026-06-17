@@ -18,8 +18,22 @@ Command-line tools for managing and enriching a rekordbox 6/7 library through th
 ```bash
 git clone https://github.com/agusdutra/rekordbox-cli.git
 cd rekordbox-cli
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 ```
+
+## Startup command (no repeated setup)
+
+Use the included startup wrapper to auto-create/use `.venv`, install dependencies when needed, and run `rb`:
+
+```bash
+./start --help
+./start genre set --dry-run
+./start playlist sort "Boda Majo/My Playlist" --dry-run
+```
+
+If you run `./start` without arguments, it shows `rb --help`.
 
 ## Configuration
 
@@ -42,6 +56,8 @@ Run commands through the `rb` entry point:
 rb --help
 rb genre --help
 rb spotify --help
+rb playlist --help
+rb collection --help
 ```
 
 ### Genre tagging
@@ -90,6 +106,31 @@ rb history latest --playlist-name "My Set History"
 
 This prints the latest playback history, copies it to your clipboard, and creates a playlist from the tracks.
 
+### Playlist tools
+
+```bash
+rb playlist sort "playlist name"
+rb playlist sort "Boda Majo/playlist name"
+rb playlist sort "playlist name" --by "genre,key,bpm"
+rb playlist sort "playlist name" --by "bpm,key,genre"
+rb playlist sort "playlist name" --by "key,bpm,genre"
+rb playlist sort "playlist name" --dry-run
+rb playlist sort "playlist name" --verbose
+```
+
+This sorts a rekordbox playlist using genre, key, and BPM. Genre sorting uses an energy-based priority map built from the genres in your database, so chill genres come first and peak-time genres come last. Key sorting follows a circle-of-fifths progression so consecutive keys mix harmonically. Use `--by` to choose the priority order. Folder paths are supported with `folder/playlist`. With `--dry-run` or `--verbose`, the sorted track list is printed in the console.
+
+### Collection tools
+
+```bash
+rb collection dedupe --dry-run
+rb collection dedupe
+rb collection dedupe --verbose
+rb collection dedupe --dry-run --include-tentative --verbose
+```
+
+This removes duplicate collection entries (same local file key), rewires dependent references to the kept track, and then deletes duplicates. Use `--verbose` to print detection diagnostics and candidate duplicate groups. Add `--include-tentative` to also consider likely duplicates by artist+title.
+
 ### Spotify tools
 
 ```bash
@@ -98,9 +139,12 @@ rb spotify playlists
 rb spotify diff "playlist name"
 rb spotify missing "playlist name"
 rb spotify missing "playlist name" --output "Missing Tracks"
+rb spotify to-rekordbox "playlist name"
+rb spotify to-rekordbox "playlist name" --output "RB Playlist Name"
+rb spotify to-rekordbox "playlist name" --dry-run
 ```
 
-Use these commands to compare Spotify playlists with your local rekordbox library or create a Spotify playlist of missing tracks.
+Use these commands to compare Spotify playlists with your local rekordbox library, create a Spotify playlist of missing tracks, or create a rekordbox playlist from Spotify tracks that are already in your local collection.
 
 ## Safety
 
