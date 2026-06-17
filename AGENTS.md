@@ -40,6 +40,7 @@ pip install -e .
 
 ```bash
 rb --help
+./start --help
 rb genre set --dry-run
 rb genre set --force
 rb genre show

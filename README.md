@@ -23,6 +23,18 @@ source .venv/bin/activate
 pip install -e .
 ```
 
+## Startup command (no repeated setup)
+
+Use the included startup wrapper to auto-create/use `.venv`, install dependencies when needed, and run `rb`:
+
+```bash
+./start --help
+./start genre set --dry-run
+./start playlist sort "Boda Majo/My Playlist" --dry-run
+```
+
+If you run `./start` without arguments, it shows `rb --help`.
+
 ## Configuration
 
 Create a `.env` file in the project root or export variables in your shell.
@@ -101,11 +113,12 @@ rb playlist sort "playlist name"
 rb playlist sort "Boda Majo/playlist name"
 rb playlist sort "playlist name" --by "genre,key,bpm"
 rb playlist sort "playlist name" --by "bpm,key,genre"
+rb playlist sort "playlist name" --by "key,bpm,genre"
 rb playlist sort "playlist name" --dry-run
 rb playlist sort "playlist name" --verbose
 ```
 
-This sorts a rekordbox playlist using genre, key, and BPM. Use `--by` to choose the priority order. Folder paths are supported with `folder/playlist`. With `--dry-run` or `--verbose`, the sorted track list is printed in the console.
+This sorts a rekordbox playlist using genre, key, and BPM. Genre sorting uses an energy-based priority map built from the genres in your database, so chill genres come first and peak-time genres come last. Key sorting follows a circle-of-fifths progression so consecutive keys mix harmonically. Use `--by` to choose the priority order. Folder paths are supported with `folder/playlist`. With `--dry-run` or `--verbose`, the sorted track list is printed in the console.
 
 ### Collection tools
 

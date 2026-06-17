@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# This script must be sourced and should never exit your interactive shell.
+_start_shell_fail() {
+  echo "$1"
+  return 1 2>/dev/null || exit 1
+}
+
+_is_sourced=0
+if [[ -n "${BASH_VERSION:-}" ]]; then
+  [[ "${BASH_SOURCE[0]}" != "${0}" ]] && _is_sourced=1
+elif [[ -n "${ZSH_VERSION:-}" ]]; then
+  case "${ZSH_EVAL_CONTEXT:-}" in
+    *:file) _is_sourced=1 ;;
+  esac
+fi
+
+if [[ "${_is_sourced}" -ne 1 ]]; then
+  _start_shell_fail "Run this script with: source ./start-shell"
+fi
+
+# Works when sourced from bash or zsh.
+SCRIPT_PATH=""
+if [[ -n "${BASH_VERSION:-}" ]]; then
+  SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [[ -n "${ZSH_VERSION:-}" ]]; then
+  SCRIPT_PATH="${(%):-%x}"
+fi
+
+if [[ -z "${SCRIPT_PATH}" ]]; then
+  _start_shell_fail "Could not resolve script path. Run from repo root: source ./start-shell"
+fi
+
+ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+VENV_DIR="${ROOT_DIR}/.venv"
+STAMP_FILE="${VENV_DIR}/.rb-install-stamp"
+
+if [[ ! -d "${VENV_DIR}" ]]; then
+  echo "Creating virtual environment..."
+  python3 -m venv "${VENV_DIR}" || _start_shell_fail "Failed creating virtual environment."
+fi
+
+source "${VENV_DIR}/bin/activate" || _start_shell_fail "Failed activating virtual environment."
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+if [[ ! -x "${VENV_DIR}/bin/rb" || ! -f "${STAMP_FILE}" || "${ROOT_DIR}/pyproject.toml" -nt "${STAMP_FILE}" ]]; then
+  echo "Installing/updating dependencies..."
+  pip install -e "${ROOT_DIR}" >/dev/null || _start_shell_fail "Dependency installation failed."
+  date +%s > "${STAMP_FILE}"
+fi
+
+echo "Virtual environment is active. Run: rb --help"

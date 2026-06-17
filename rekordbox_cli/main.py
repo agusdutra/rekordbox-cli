@@ -13,6 +13,12 @@ import click
 
 from .db import get_database, safe_commit
 from .genre import print_summary, set_genres
+from .sorting import (
+    build_genre_priority_map,
+    enforce_run_limits,
+    parse_sort_priority,
+    playlist_sort_key,
+)
 
 
 def _load_env():
@@ -105,16 +111,6 @@ def _find_rekordbox_playlist(playlists, playlist_lookup):
     return None, None
 
 
-def _parse_sort_priority(sort_by: str) -> list[str]:
-    """Parse and validate playlist sort priorities."""
-    priorities = [p.strip().lower() for p in sort_by.split(",") if p.strip()]
-    if len(priorities) != 3 or set(priorities) != {"genre", "key", "bpm"}:
-        raise click.ClickException(
-            "Invalid --by value. Use all fields once, e.g. 'genre,key,bpm' or 'bpm,key,genre'."
-        )
-    return priorities
-
-
 def _playlist_track_sort_fields(content):
     """Extract normalized sortable fields from a rekordbox content entry."""
     genre_name = content.Genre.Name.strip() if content and content.Genre and content.Genre.Name else ""
@@ -130,25 +126,6 @@ def _playlist_track_sort_fields(content):
         "artist": artist,
         "title": title,
     }
-
-
-def _playlist_sort_key(fields: dict, priorities: list[str]):
-    """Build tuple sort key from selected priority order."""
-    parts = []
-    for priority in priorities:
-        if priority == "genre":
-            genre = fields["genre"].lower()
-            parts.append((0, genre) if genre else (1, ""))
-        elif priority == "key":
-            key = fields["key"].lower()
-            parts.append((0, key) if key else (1, ""))
-        elif priority == "bpm":
-            bpm = fields["bpm"]
-            parts.append((0, bpm) if bpm is not None else (1, float("inf")))
-
-    parts.append(fields["artist"].lower())
-    parts.append(fields["title"].lower())
-    return tuple(parts)
 
 
 def _normalize_collection_path(folder_path: str) -> str | None:
@@ -488,7 +465,7 @@ def playlist_list(counts):
     "--by",
     "sort_by",
     default="genre,key,bpm",
-    help="Sort priority using all of: genre,key,bpm (default: genre,key,bpm).",
+    help="Sort priority using all of: genre,key,bpm (default), bpm,key,genre, or key,bpm,genre. Key sorting follows a circle-of-fifths progression so adjacent keys mix harmonically.",
 )
 @click.option("--dry-run", is_flag=True, help="Preview sorting without writing.")
 @click.option("--verbose", "-v", is_flag=True, help="Show sorted track list in console.")
@@ -496,12 +473,13 @@ def playlist_sort(playlist_name, sort_by, dry_run, verbose):
     """Sort a rekordbox playlist using genre, key, and BPM."""
     from pyrekordbox.db6.tables import DjmdSongPlaylist
 
-    priorities = _parse_sort_priority(sort_by)
+    priorities, no_tiebreakers = parse_sort_priority(sort_by)
 
     click.echo("Opening rekordbox database...")
     db = get_database()
     try:
         playlists = db.get_playlist().all()
+        genre_priority_map = build_genre_priority_map(db.get_genre().all())
         target_playlist, ambiguous_paths = _find_rekordbox_playlist(playlists, playlist_name)
         if ambiguous_paths:
             click.echo(click.style(f"✗ Playlist '{playlist_name}' is ambiguous. Use a full path.", fg="red"))
@@ -535,11 +513,18 @@ def playlist_sort(playlist_name, sort_by, dry_run, verbose):
                 {
                     "song": ps,
                     "fields": fields,
-                    "sort_key": _playlist_sort_key(fields, priorities),
+                    "sort_key": playlist_sort_key(
+                        fields,
+                        priorities,
+                        genre_priority_map,
+                        include_tiebreakers=not no_tiebreakers,
+                    ),
                 }
             )
 
         sorted_rows = sorted(sortable_rows, key=lambda row: row["sort_key"])
+        if priorities and priorities[0] == "genre":
+            sorted_rows = enforce_run_limits(sorted_rows)
         changed = sum(1 for new_pos, row in enumerate(sorted_rows, start=1) if row["song"].TrackNo != new_pos)
 
         click.echo(f"\nPlaylist: {target_playlist.Name}")
